@@ -8,7 +8,7 @@
 
 | 列表 | 说明 | 地址 |
 |---|---|---|
-| IPTV.m3u | 全部可用频道 | `https://raw.githubusercontent.com/amygoTV/Livelist/main/IPTV.m3u` |
+| IPTV.m3u | CCTV + 卫视 + 指定香港频道 + 稳定台湾地区频道 | `https://raw.githubusercontent.com/amygoTV/Livelist/main/IPTV.m3u` |
 | CCTV.m3u | 央视频道 | `https://raw.githubusercontent.com/amygoTV/Livelist/main/CCTV.m3u` |
 | CNTV.m3u | 卫视频道 + 凤凰卫视/凤凰资讯/星空卫视 | `https://raw.githubusercontent.com/amygoTV/Livelist/main/CNTV.m3u` |
 | EPG.xml | 节目单 | `https://raw.githubusercontent.com/amygoTV/Livelist/main/EPG.xml` |
@@ -21,8 +21,8 @@
    - `iptv-org/iptv`：`streams/cn.m3u`、`hk.m3u`、`tw.m3u`、`mo.m3u`（分别对应中国内地、中国香港、中国台湾地区、中国澳门）
    - `fanmingming/live`：IPv6 列表（央视/卫视补充）
    - `Guovin/iptv-api`：其 GitHub Pages 发布的测速结果 `result.m3u`
-2. **清洗**：仅保留 CCTV、卫视，以及凤凰卫视 / 凤凰资讯 / 星空卫视；剔除成人频道与更新时间戳等元数据行，按频道名归一化去重，每个频道最多保留 6 个候选接口。
-3. **验活**：32 并发对接口发起带 Range 的请求，只保留 200/206 且有媒体数据的地址；同频道**优先 IPv6 接口**，再按响应延迟排序，每频道保留最快 4 条。
+2. **清洗**：仅保留 CCTV、卫视、凤凰卫视 / 凤凰资讯 / 星空卫视，以及台湾地区候选频道；剔除成人频道与更新时间戳等元数据行，按频道名归一化去重，每个频道最多保留 6 个候选接口。
+3. **验活**：32 并发对接口发起带 Range 的请求，只保留 200/206 且有媒体数据的地址；同频道**优先 IPv6 接口**，再按响应延迟排序，每频道保留最快 4 条。台湾地区频道需额外通过稳定性门槛：至少有 1 条可用接口，且最快延迟不超过 1500ms（可用 `--tw-min-urls` / `--tw-max-latency` 调整）。
 4. **产出**：覆盖写入 `IPTV.m3u` / `CCTV.m3u` / `CNTV.m3u`，更新 `EPG.xml` 与 `STATUS.md`，由 Actions 自动提交。
 
 所有逻辑在 [`scripts/update_livelist.py`](scripts/update_livelist.py)，仅使用 Python 标准库。
@@ -42,11 +42,14 @@ python scripts/update_livelist.py
 ```bash
 # 跳过验活，用本地 m3u 快速演练
 python scripts/update_livelist.py --source-file sample/cn.m3u --skip-validate --no-epg --output-dir out
+
+# 调整台湾地区频道的稳定性门槛
+python scripts/update_livelist.py --tw-min-urls 1 --tw-max-latency 1500
 ```
 
 ## 文件说明
 
-- `IPTV.m3u`：自动生成，仅含 CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视，请勿手工编辑（下次更新会被覆盖）。
+- `IPTV.m3u`：自动生成，仅含 CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视 + 通过稳定性门槛的台湾地区频道，请勿手工编辑（下次更新会被覆盖）。
 - `CCTV.m3u` / `CNTV.m3u`：自动生成，分别是央视频道、卫视（含指定香港频道）子集，请勿手工编辑。
 - `EPG.xml`：节目单，抓取失败时保留上一版。
 - `Livelist-QI.m3u`：历史遗留文件，新流水线不改动。

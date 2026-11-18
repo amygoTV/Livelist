@@ -4,8 +4,9 @@
 
 Fetch Chinese-language IPTV playlists from several public sources, keep only
 CCTV / satellite (卫视) / selected Hong Kong channels (凤凰卫视、凤凰资讯、
-星空卫视), validate stream URLs concurrently with IPv6 preference, then write
-CCTV.m3u / CNTV.m3u / IPTV.m3u and a STATUS.md report. Standard library only.
+星空卫视), plus Taiwan-region channels that pass a reliability gate. Stream
+URLs are validated concurrently with IPv6 preference, then CCTV.m3u /
+CNTV.m3u / IPTV.m3u and a STATUS.md report are written. Standard library only.
 
 Usage:
     python scripts/update_livelist.py
@@ -45,6 +46,15 @@ CNTV_RE = re.compile(
     r"(卫视|卫星|凤凰卫视|凤凰资讯|星空卫视|phoenix\s*(?:tv|info)|\bifeng\b|star\s*chinese)",
     re.I,
 )
+# 台湾地区频道先进入验活，只有满足下列稳定性门槛才写入列表。
+TW_RE = re.compile(
+    r"(台湾|台視|台视|中視|中视|華視|华视|民視|民视|三立|中天|東森|东森|"
+    r"TVBS|公視|公视|年代|壹电视|鏡电视|镜电视|MOMO|非凡|寰宇|"
+    r"\bTTV\b|\bCTV\b|\bPTS\b|\bFTV\b|\bEBC\b|\bERA\b|\bGTV\b|\bSETN\b|\bMOMOTV\b)",
+    re.I,
+)
+TW_MIN_URLS = 1
+TW_MAX_LATENCY_MS = 1500
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 NOISE_RE = re.compile(r"[\s\-_（）()【】\[\]·.、,，]+")
@@ -52,15 +62,18 @@ SUFFIX_RE = re.compile(r"(高清|超清|蓝光|频道|直播|hd|uhd|fhd|4k|1080p
 
 
 class Channel(object):
-    __slots__ = ("name", "tvg_id", "tvg_logo", "group", "urls", "source")
+    __slots__ = ("name", "tvg_id", "tvg_logo", "group", "urls", "source",
+                 "region", "fastest_ms")
 
-    def __init__(self, name, tvg_id, tvg_logo, group, url, source):
+    def __init__(self, name, tvg_id, tvg_logo, group, url, source, region="", fastest_ms=None):
         self.name = name
         self.tvg_id = tvg_id
         self.tvg_logo = tvg_logo
         self.group = group
         self.urls = [url]
         self.source = source
+        self.region = region
+        self.fastest_ms = fastest_ms
 
     def key(self):
         k = NOISE_RE.sub("", self.name).upper()
@@ -72,11 +85,18 @@ def log(msg):
 
 
 def is_allowed(ch):
-    """Only CCTV, mainland satellite channels and the three named HK channels."""
+    """CCTV, mainland satellite, three named HK channels, or TW candidates."""
+    if ch.region == "TW":
+        return True
     for pattern in (CCTV_RE, CNTV_RE):
         if pattern.search(ch.name) or pattern.search(ch.group):
             return True
     return False
+
+
+def is_tw_source(source):
+    upper = source.upper()
+    return "TW" in upper or "TAIWAN" in upper or "台湾" in source
 
 
 def is_ipv6(url):
@@ -129,6 +149,7 @@ def parse_m3u(text, source):
             continue
         if ADULT_RE.search(name) or ADULT_RE.search(group):
             continue
+        region = "TW" if (is_tw_source(source) or TW_RE.search(name) or TW_RE.search(group)) else ""
         result.append(Channel(
             name=name,
             tvg_id=attrs.get("tvg-id", ""),
@@ -136,6 +157,7 @@ def parse_m3u(text, source):
             group=group,
             url=url,
             source=source,
+            region=region,
         ))
     return result
 
@@ -157,6 +179,8 @@ def merge(channels):
             existing.tvg_logo = ch.tvg_logo
         if existing.group == "其他" and ch.group != "其他":
             existing.group = ch.group
+        if ch.region and not existing.region:
+            existing.region = ch.region
     return list(merged.values())
 
 
@@ -218,6 +242,7 @@ def validate(channels, workers, timeout, max_checks):
         if not hits:
             continue
         ch.urls = [u for _, u in hits[:4]]
+        ch.fastest_ms = min(ms for ms, _ in hits)
         kept.append(ch)
     ipv6_total = sum(1 for ch in kept for u in ch.urls if is_ipv6(u))
     log("验活通过: %d/%d 个频道 (IPv6 接口 %d 条)" % (len(kept), len(channels), ipv6_total))
@@ -264,8 +289,9 @@ def write_status(out_dir, stats, sources):
         "- 抓取频道: %d (去重后 %d)" % (stats["raw"], stats["merged"]),
         "- 验活通过: %d" % stats["valid"],
         "- CCTV: %d / 卫视(含指定香港频道): %d" % (stats["cctv"], stats["cntv"]),
+        "- 台湾地区（通过稳定性门槛）: %d 个，剔除 %d 个" % (stats["tw"], stats["tw_dropped"]),
         "- IPv6 接口: %d 条（同频道优先）" % stats["ipv6"],
-        "- 筛选范围: CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视",
+        "- 筛选范围: CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视 + 稳定台湾地区频道",
         "",
         "## 数据源",
         "",
@@ -297,6 +323,10 @@ def main():
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--timeout", type=int, default=6)
     ap.add_argument("--max-checks", type=int, default=4000)
+    ap.add_argument("--tw-min-urls", type=int, default=TW_MIN_URLS,
+                    help="台湾地区频道至少需要的可用接口数 (default: 1)")
+    ap.add_argument("--tw-max-latency", type=int, default=TW_MAX_LATENCY_MS,
+                    help="台湾地区频道最快接口的最大延迟 ms (default: 1500)")
     ap.add_argument("--no-epg", action="store_true")
     args = ap.parse_args()
 
@@ -327,16 +357,35 @@ def main():
     log("去重后 %d 个频道" % len(merged))
     merged_total = len(merged)
     merged = [ch for ch in merged if is_allowed(ch)]
-    log("按 CCTV/卫视/指定香港频道过滤后 %d 个频道" % len(merged))
+    log("按 CCTV/卫视/指定香港频道/台湾地区候选过滤后 %d 个频道" % len(merged))
     merged = merged[:args.max_channels]
 
+    tw_dropped = 0
     if args.skip_validate:
-        kept = merged
+        tw_candidates = [ch for ch in merged if ch.region == "TW"]
+        if tw_candidates:
+            log("已跳过验活，%d 个台湾地区频道因无法判定稳定性不纳入" % len(tw_candidates))
+            tw_dropped = len(tw_candidates)
+        kept = [ch for ch in merged if ch.region != "TW"]
         log("已跳过验活 (--skip-validate)")
     else:
         kept = validate(merged, args.workers, args.timeout, args.max_checks)
         for ch in kept:
             ch.urls = ch.urls[:args.max_urls]
+        tw_all = [ch for ch in kept if ch.region == "TW"]
+        tw_ok_ids = set()
+        for ch in tw_all:
+            good = (len(ch.urls) >= args.tw_min_urls
+                    and ch.fastest_ms is not None
+                    and ch.fastest_ms <= args.tw_max_latency)
+            if good:
+                tw_ok_ids.add(id(ch))
+        tw_dropped = len(tw_all) - len(tw_ok_ids)
+        if tw_dropped:
+            log("台湾地区频道因稳定性不足剔除 %d 个（要求 ≥%d 条可用接口且最快延迟 ≤%dms）"
+                % (tw_dropped, args.tw_min_urls, args.tw_max_latency))
+        if tw_all:
+            kept = [ch for ch in kept if ch.region != "TW" or id(ch) in tw_ok_ids]
 
     cctv = [c for c in kept if CCTV_RE.search(c.name) or CCTV_RE.search(c.group)]
     cntv = [c for c in kept if CNTV_RE.search(c.name) or CNTV_RE.search(c.group)]
@@ -354,6 +403,8 @@ def main():
         "valid": len(kept),
         "cctv": len(cctv),
         "cntv": len(cntv),
+        "tw": sum(1 for ch in kept if ch.region == "TW"),
+        "tw_dropped": tw_dropped,
         "ipv6": sum(1 for ch in kept for u in ch.urls if is_ipv6(u)),
     }, source_stats)
     log("完成")
