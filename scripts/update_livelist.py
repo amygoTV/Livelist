@@ -56,8 +56,9 @@ TW_RE = re.compile(
 TW_MIN_URLS = 1
 TW_MAX_LATENCY_MS = 1500
 # 运营商资源：移动 / 联通，选择接口时尽量两者都保留。
-ISP_MOBILE_RE = re.compile(r"(移动|cmcc|china\s*mobile|\bmobile\b)", re.I)
-ISP_UNICOM_RE = re.compile(r"(联通|cucc|china\s*unicom|\bunicom\b)", re.I)
+ISP_MOBILE_RE = re.compile(r"(移动|cmcc|china\s*mobile)", re.I)
+ISP_UNICOM_RE = re.compile(r"(联通|cucc|china\s*unicom)", re.I)
+OTHER_GROUP_RE = re.compile(r"^(其他|其它|未分类|other|uncategorized)?$", re.I)
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 NOISE_RE = re.compile(r"[\s\-_（）()【】\[\]·.、,，]+")
@@ -114,6 +115,25 @@ def detect_isp(*parts):
         return "移动"
     if ISP_UNICOM_RE.search(text):
         return "联通"
+    return ""
+
+
+def is_other_group(ch):
+    """True for the catch-all '其他' / empty group that should be dropped."""
+    return bool(OTHER_GROUP_RE.match((ch.group or "").strip()))
+
+
+def fix_uncategorized(ch):
+    """Promote TW / ISP channels out of '其他' before the category filter."""
+    if not is_other_group(ch):
+        return ""
+    if ch.region == "TW":
+        ch.group = "台湾地区"
+        return "tw"
+    text = " ".join((ch.name, ch.source) + tuple(ch.urls))
+    if ISP_MOBILE_RE.search(text) or ISP_UNICOM_RE.search(text):
+        ch.group = "运营商"
+        return "isp"
     return ""
 
 
@@ -331,8 +351,9 @@ def write_status(out_dir, stats, sources):
         "- CCTV: %d / 卫视(含指定香港频道): %d" % (stats["cctv"], stats["cntv"]),
         "- 台湾地区（通过稳定性门槛）: %d 个，剔除 %d 个" % (stats["tw"], stats["tw_dropped"]),
         "- 运营商: 移动 %d / 联通 %d / 双网 %d 个频道" % (stats["mobile"], stats["unicom"], stats["both"]),
+        "- 剔除“其他”类目: %d 个（台湾地区/运营商已归类保留）" % stats["other_dropped"],
         "- IPv6 接口: %d 条（同频道优先）" % stats["ipv6"],
-        "- 筛选范围: CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视 + 稳定台湾地区频道",
+        "- 筛选范围: CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视 + 稳定台湾地区频道 + 移动/联通资源",
         "",
         "## 数据源",
         "",
@@ -397,6 +418,20 @@ def main():
     merged = merge(all_channels)
     log("去重后 %d 个频道" % len(merged))
     merged_total = len(merged)
+    tw_regrouped = 0
+    isp_regrouped = 0
+    for ch in merged:
+        kind = fix_uncategorized(ch)
+        if kind == "tw":
+            tw_regrouped += 1
+        elif kind == "isp":
+            isp_regrouped += 1
+    before_other = len(merged)
+    merged = [ch for ch in merged if not is_other_group(ch)]
+    other_dropped = before_other - len(merged)
+    if other_dropped:
+        log("剔除“其他”类目 %d 个（台湾地区 %d / 运营商 %d 已归类保留）"
+            % (other_dropped, tw_regrouped, isp_regrouped))
     merged = [ch for ch in merged if is_allowed(ch)]
     log("按 CCTV/卫视/指定香港频道/台湾地区候选过滤后 %d 个频道" % len(merged))
     merged = merged[:args.max_channels]
@@ -447,6 +482,7 @@ def main():
         "cntv": len(cntv),
         "tw": sum(1 for ch in kept if ch.region == "TW"),
         "tw_dropped": tw_dropped,
+        "other_dropped": other_dropped,
         "mobile": sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)),
         "unicom": sum(1 for ch in kept if any(i == "联通" for i in ch.url_isps)),
         "both": sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)
