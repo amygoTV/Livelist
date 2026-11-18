@@ -59,6 +59,10 @@ TW_MAX_LATENCY_MS = 1500
 ISP_MOBILE_RE = re.compile(r"(移动|cmcc|china\s*mobile)", re.I)
 ISP_UNICOM_RE = re.compile(r"(联通|cucc|china\s*unicom)", re.I)
 OTHER_GROUP_RE = re.compile(r"^(其他|其它|未分类|other|uncategorized)?$", re.I)
+GOODTV_RE = re.compile(r"(good\s*tv|好电视)", re.I)
+DISPLAY_GROUPS = ("央视", "卫视", "港澳台", "央视付费")
+GROUP_ORDER = dict((name, i) for i, name in enumerate(DISPLAY_GROUPS))
+MAX_OUTPUT_URLS = 10
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 NOISE_RE = re.compile(r"[\s\-_（）()【】\[\]·.、,，]+")
@@ -67,10 +71,10 @@ SUFFIX_RE = re.compile(r"(高清|超清|蓝光|频道|直播|hd|uhd|fhd|4k|1080p
 
 class Channel(object):
     __slots__ = ("name", "tvg_id", "tvg_logo", "group", "urls", "source",
-                 "region", "fastest_ms", "url_isps")
+                 "region", "fastest_ms", "url_isps", "display_group")
 
     def __init__(self, name, tvg_id, tvg_logo, group, url, source, region="",
-                 fastest_ms=None, isp=""):
+                 fastest_ms=None, isp="", display_group=""):
         self.name = name
         self.tvg_id = tvg_id
         self.tvg_logo = tvg_logo
@@ -80,6 +84,7 @@ class Channel(object):
         self.region = region
         self.fastest_ms = fastest_ms
         self.url_isps = [isp]
+        self.display_group = display_group
 
     def key(self):
         k = NOISE_RE.sub("", self.name).upper()
@@ -137,6 +142,23 @@ def fix_uncategorized(ch):
     return ""
 
 
+def classify_display_group(ch):
+    """Map a channel into the four display groups requested by the user."""
+    text = " ".join((ch.name, ch.group))
+    if (u"付费" in text or "pay" in text.lower()) and CCTV_RE.search(text):
+        return u"央视付费"
+    if CCTV_RE.search(text):
+        return u"央视"
+    lower = text.lower()
+    if (ch.region == "TW" or u"港澳台" in ch.group or u"凤凰" in text
+            or u"星空" in text or u"翡翠" in text or u"本港" in text
+            or "tvb" in lower):
+        return u"港澳台"
+    if CNTV_RE.search(text):
+        return u"卫视"
+    return ""
+
+
 def is_ipv6(url):
     """Return True when the stream URL points to an IPv6 literal host."""
     try:
@@ -187,6 +209,8 @@ def parse_m3u(text, source):
             continue
         if ADULT_RE.search(name) or ADULT_RE.search(group):
             continue
+        if GOODTV_RE.search(name) or GOODTV_RE.search(group) or GOODTV_RE.search(url):
+            continue
         region = "TW" if (is_tw_source(source) or TW_RE.search(name) or TW_RE.search(group)) else ""
         isp = detect_isp(name, group, source, url)
         result.append(Channel(
@@ -203,7 +227,7 @@ def parse_m3u(text, source):
 
 
 def merge(channels):
-    """Deduplicate by normalized name, keeping up to 6 URLs per channel."""
+    """Deduplicate by normalized name, keeping up to 12 URLs per channel."""
     merged = {}
     for ch in channels:
         k = ch.key()
@@ -213,7 +237,7 @@ def merge(channels):
             merged[k] = ch
             continue
         existing = merged[k]
-        if len(existing.urls) < 6 and ch.urls[0] not in existing.urls:
+        if len(existing.urls) < 12 and ch.urls[0] not in existing.urls:
             existing.urls.append(ch.urls[0])
             existing.url_isps.append(ch.url_isps[0] if ch.url_isps else "")
         if not existing.tvg_logo and ch.tvg_logo:
@@ -291,11 +315,11 @@ def validate(channels, workers, timeout, max_checks):
                     chosen.append(url)
                     break
         for _, url in hits:
-            if len(chosen) >= 4:
+            if len(chosen) >= MAX_OUTPUT_URLS:
                 break
             if url not in chosen:
                 chosen.append(url)
-        ch.urls = chosen[:4]
+        ch.urls = chosen[:MAX_OUTPUT_URLS]
         ch.url_isps = [isp_for.get(u, "") for u in ch.urls]
         ch.fastest_ms = min(ms for ms, _ in hits)
         kept.append(ch)
@@ -309,19 +333,21 @@ def validate(channels, workers, timeout, max_checks):
     return kept
 
 
-def extinf(ch, url):
-    return ('#EXTINF:-1 tvg-id="%s" tvg-name="%s" tvg-logo="%s" group-title="%s",%s\n%s'
-            % (ch.tvg_id, ch.name, ch.tvg_logo, ch.group, ch.name, url))
+def extinf(ch):
+    group = ch.display_group or ch.group
+    return ('#EXTINF:-1 tvg-id="%s" tvg-name="%s" tvg-logo="%s" group-title="%s",%s'
+            % (ch.tvg_id, ch.name, ch.tvg_logo, group, ch.name))
 
 
 def write_m3u(path, channels):
     lines = ["#EXTM3U"]
     for ch in channels:
-        for url in ch.urls:
-            lines.append(extinf(ch, url))
+        lines.append(extinf(ch))
+        lines.extend(ch.urls[:MAX_OUTPUT_URLS])
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
-    log("写入 %s (%d 个频道)" % (os.path.basename(path), len(channels)))
+    log("写入 %s (%d 个频道, %d 个接口)"
+        % (os.path.basename(path), len(channels), sum(len(c.urls) for c in channels)))
 
 
 def update_epg(out_dir, timeout=40):
@@ -348,7 +374,11 @@ def write_status(out_dir, stats, sources):
         "- 源数量: %d" % stats["sources"],
         "- 抓取频道: %d (去重后 %d)" % (stats["raw"], stats["merged"]),
         "- 验活通过: %d" % stats["valid"],
-        "- CCTV: %d / 卫视(含指定香港频道): %d" % (stats["cctv"], stats["cntv"]),
+        "- CCTV: %d / 卫视(含港澳台): %d" % (stats["cctv"], stats["cntv"]),
+        "- 分组: 央视 %d / 卫视 %d / 港澳台 %d / 央视付费 %d"
+        % (stats["g_cctv"], stats["g_sat"], stats["g_hkmo"], stats["g_pay"]),
+        "- 剔除 GoodTV: %d 个；未匹配四类分组: %d 个"
+        % (stats["goodtv_dropped"], stats["group_dropped"]),
         "- 台湾地区（通过稳定性门槛）: %d 个，剔除 %d 个" % (stats["tw"], stats["tw_dropped"]),
         "- 运营商: 移动 %d / 联通 %d / 双网 %d 个频道" % (stats["mobile"], stats["unicom"], stats["both"]),
         "- 剔除“其他”类目: %d 个（台湾地区/运营商已归类保留）" % stats["other_dropped"],
@@ -381,7 +411,7 @@ def main():
     ap.add_argument("--source-file", action="append", default=[], help="Use local m3u file instead of remote sources (repeatable)")
     ap.add_argument("--skip-validate", action="store_true", help="Skip URL probing (fast dry run)")
     ap.add_argument("--max-channels", type=int, default=1500)
-    ap.add_argument("--max-urls", type=int, default=4)
+    ap.add_argument("--max-urls", type=int, default=MAX_OUTPUT_URLS)
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--timeout", type=int, default=6)
     ap.add_argument("--max-checks", type=int, default=4000)
@@ -418,6 +448,13 @@ def main():
     merged = merge(all_channels)
     log("去重后 %d 个频道" % len(merged))
     merged_total = len(merged)
+    before_goodtv = len(merged)
+    merged = [ch for ch in merged
+              if not (GOODTV_RE.search(ch.name) or GOODTV_RE.search(ch.group)
+                      or any(GOODTV_RE.search(u) for u in ch.urls))]
+    goodtv_dropped = before_goodtv - len(merged)
+    if goodtv_dropped:
+        log("剔除 GoodTV 频道 %d 个" % goodtv_dropped)
     tw_regrouped = 0
     isp_regrouped = 0
     for ch in merged:
@@ -464,8 +501,17 @@ def main():
         if tw_all:
             kept = [ch for ch in kept if ch.region != "TW" or id(ch) in tw_ok_ids]
 
-    cctv = [c for c in kept if CCTV_RE.search(c.name) or CCTV_RE.search(c.group)]
-    cntv = [c for c in kept if CNTV_RE.search(c.name) or CNTV_RE.search(c.group)]
+    for ch in kept:
+        ch.display_group = classify_display_group(ch)
+    before_group = len(kept)
+    kept = [ch for ch in kept if ch.display_group]
+    group_dropped = before_group - len(kept)
+    if group_dropped:
+        log("按央视/卫视/港澳台/央视付费四类分组剔除 %d 个未匹配频道" % group_dropped)
+    kept.sort(key=lambda c: GROUP_ORDER.get(c.display_group, 99))
+
+    cctv = [c for c in kept if c.display_group in ("央视", "央视付费")]
+    cntv = [c for c in kept if c.display_group in ("卫视", "港澳台")]
     write_m3u(os.path.join(out, "IPTV.m3u"), kept)
     write_m3u(os.path.join(out, "CCTV.m3u"), cctv)
     write_m3u(os.path.join(out, "CNTV.m3u"), cntv)
@@ -483,6 +529,12 @@ def main():
         "tw": sum(1 for ch in kept if ch.region == "TW"),
         "tw_dropped": tw_dropped,
         "other_dropped": other_dropped,
+        "goodtv_dropped": goodtv_dropped,
+        "group_dropped": group_dropped,
+        "g_cctv": sum(1 for ch in kept if ch.display_group == "央视"),
+        "g_sat": sum(1 for ch in kept if ch.display_group == "卫视"),
+        "g_hkmo": sum(1 for ch in kept if ch.display_group == "港澳台"),
+        "g_pay": sum(1 for ch in kept if ch.display_group == "央视付费"),
         "mobile": sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)),
         "unicom": sum(1 for ch in kept if any(i == "联通" for i in ch.url_isps)),
         "both": sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)
