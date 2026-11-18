@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """Livelist auto updater.
 
-Fetch Chinese-language IPTV playlists from several public sources, validate
-stream URLs concurrently, then write CCTV.m3u / CNTV.m3u / IPTV.m3u and a
-STATUS.md report. Uses only the Python standard library.
+Fetch Chinese-language IPTV playlists from several public sources, keep only
+CCTV / satellite (卫视) / selected Hong Kong channels (凤凰卫视、凤凰资讯、
+星空卫视), validate stream URLs concurrently with IPv6 preference, then write
+CCTV.m3u / CNTV.m3u / IPTV.m3u and a STATUS.md report. Standard library only.
 
 Usage:
     python scripts/update_livelist.py
@@ -20,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Livelist-AutoUpdate/1.0"
 
@@ -38,7 +40,11 @@ EPG_URL = "https://epg.112114.xyz/pp.xml"
 ADULT_RE = re.compile(r"(成人|十八|18\+|xxx|adult|porn|色情|成人视频|日本成人)", re.I)
 META_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s", re.I)
 CCTV_RE = re.compile(r"(cctv|央视|中央|cntv)", re.I)
-CNTV_RE = re.compile(r"(卫视|卫星|tvb|翡翠|本港|有线|now\s*宽频|华视|民视|三立|中天|东森)", re.I)
+# 仅保留大陆卫视 + 指定的中国香港频道，不再纳入其他港台频道
+CNTV_RE = re.compile(
+    r"(卫视|卫星|凤凰卫视|凤凰资讯|星空卫视|phoenix\s*(?:tv|info)|\bifeng\b|star\s*chinese)",
+    re.I,
+)
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 NOISE_RE = re.compile(r"[\s\-_（）()【】\[\]·.、,，]+")
@@ -63,6 +69,23 @@ class Channel(object):
 
 def log(msg):
     print("[%s] %s" % (datetime.datetime.now().strftime("%H:%M:%S"), msg), flush=True)
+
+
+def is_allowed(ch):
+    """Only CCTV, mainland satellite channels and the three named HK channels."""
+    for pattern in (CCTV_RE, CNTV_RE):
+        if pattern.search(ch.name) or pattern.search(ch.group):
+            return True
+    return False
+
+
+def is_ipv6(url):
+    """Return True when the stream URL points to an IPv6 literal host."""
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return False
+    return ":" in host
 
 
 def fetch(url, timeout=25):
@@ -190,12 +213,14 @@ def validate(channels, workers, timeout, max_checks):
             good.setdefault(idx, []).append((ms, url))
     kept = []
     for idx, ch in enumerate(channels):
-        hits = sorted(good.get(idx, []))
+        # IPv6 接口优先；同等协议下按响应延迟排序
+        hits = sorted(good.get(idx, []), key=lambda item: (0 if is_ipv6(item[1]) else 1, item[0]))
         if not hits:
             continue
         ch.urls = [u for _, u in hits[:4]]
         kept.append(ch)
-    log("验活通过: %d/%d 个频道" % (len(kept), len(channels)))
+    ipv6_total = sum(1 for ch in kept for u in ch.urls if is_ipv6(u))
+    log("验活通过: %d/%d 个频道 (IPv6 接口 %d 条)" % (len(kept), len(channels), ipv6_total))
     return kept
 
 
@@ -238,7 +263,9 @@ def write_status(out_dir, stats, sources):
         "- 源数量: %d" % stats["sources"],
         "- 抓取频道: %d (去重后 %d)" % (stats["raw"], stats["merged"]),
         "- 验活通过: %d" % stats["valid"],
-        "- CCTV: %d / 卫视: %d" % (stats["cctv"], stats["cntv"]),
+        "- CCTV: %d / 卫视(含指定香港频道): %d" % (stats["cctv"], stats["cntv"]),
+        "- IPv6 接口: %d 条（同频道优先）" % stats["ipv6"],
+        "- 筛选范围: CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视",
         "",
         "## 数据源",
         "",
@@ -299,6 +326,8 @@ def main():
     merged = merge(all_channels)
     log("去重后 %d 个频道" % len(merged))
     merged_total = len(merged)
+    merged = [ch for ch in merged if is_allowed(ch)]
+    log("按 CCTV/卫视/指定香港频道过滤后 %d 个频道" % len(merged))
     merged = merged[:args.max_channels]
 
     if args.skip_validate:
@@ -325,6 +354,7 @@ def main():
         "valid": len(kept),
         "cctv": len(cctv),
         "cntv": len(cntv),
+        "ipv6": sum(1 for ch in kept for u in ch.urls if is_ipv6(u)),
     }, source_stats)
     log("完成")
     return 0
