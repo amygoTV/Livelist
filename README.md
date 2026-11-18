@@ -48,7 +48,7 @@ python scripts/update_livelist.py --source-file sample/cn.m3u --skip-validate --
 
 - `IPTV.m3u` / `CCTV.m3u` / `CNTV.m3u`：自动生成，请勿手工编辑（下次更新会被覆盖）。
 - `EPG.xml`：节目单，抓取失败时保留上一版。
-- `Adult.m3u` / `Livelist-QI.m3u`：历史遗留文件，新流水线不改动。
+- `Livelist-QI.m3u`：历史遗留文件，新流水线不改动。
 - `STATUS.md`：最近一次更新时间、各源条数、验活统计。
 - `更新日志.md`：版本与变更记录。
 
