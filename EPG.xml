@@ -17631,6 +17631,9 @@
 	<programme channel="咪咕足球" start="20261118220000 +0800" stop="20261118221500 +0800">
 		<title lang="zh">频道宣传</title>
 	</programme>
+	<programme channel="咪咕足球" start="20261118221500 +0800" stop="20261118235500 +0800">
+		<title lang="zh">UFC格斗之夜291期 主赛</title>
+	</programme>
 	<channel id="四大名著剧场">
 		<display-name lang="zh">四大名著剧场</display-name>
 	</channel>
@@ -58218,6 +58221,9 @@
 	<programme channel="newtv超级综艺" start="20261118205000 +0800" stop="20261118220700 +0800">
 		<title lang="zh">全民畅舞</title>
 	</programme>
+	<programme channel="newtv超级综艺" start="20261118220700 +0800" stop="20261118234600 +0800">
+		<title lang="zh">笑有新生</title>
+	</programme>
 	<channel id="newtv超级体育">
 		<display-name lang="zh">NEWTV超级体育</display-name>
 	</channel>
@@ -58286,6 +58292,9 @@
 	</programme>
 	<programme channel="newtv超级体育" start="20261118213000 +0800" stop="20261118223500 +0800">
 		<title lang="zh">体育世界</title>
+	</programme>
+	<programme channel="newtv超级体育" start="20261118223500 +0800" stop="20261118233500 +0800">
+		<title lang="zh">实况录像-WTT法兰克福冠军赛2026 比赛 1</title>
 	</programme>
 	<channel id="newtv超级电影">
 		<display-name lang="zh">NEWTV超级电影</display-name>
@@ -58436,6 +58445,9 @@
 	</programme>
 	<programme channel="newtv超级电视剧" start="20261118215900 +0800" stop="20261118224100 +0800">
 		<title lang="zh">30_爱拼会赢（4K）</title>
+	</programme>
+	<programme channel="newtv超级电视剧" start="20261118224100 +0800" stop="20261118232200 +0800">
+		<title lang="zh">31_爱拼会赢（4K）</title>
 	</programme>
 	<channel id="newtv精品大剧">
 		<display-name lang="zh">NEWTV精品大剧</display-name>
@@ -59081,6 +59093,9 @@
 	</programme>
 	<programme channel="newtv金牌综艺" start="20261118213400 +0800" stop="20261118221900 +0800">
 		<title lang="zh">面具背后25</title>
+	</programme>
+	<programme channel="newtv金牌综艺" start="20261118221900 +0800" stop="20261118224900 +0800">
+		<title lang="zh">美好生活第六期</title>
 	</programme>
 	<channel id="newtv精品体育">
 		<display-name lang="zh">NEWTV精品体育</display-name>
