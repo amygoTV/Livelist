@@ -55,6 +55,9 @@ TW_RE = re.compile(
 )
 TW_MIN_URLS = 1
 TW_MAX_LATENCY_MS = 1500
+# 运营商资源：移动 / 联通，选择接口时尽量两者都保留。
+ISP_MOBILE_RE = re.compile(r"(移动|cmcc|china\s*mobile|\bmobile\b)", re.I)
+ISP_UNICOM_RE = re.compile(r"(联通|cucc|china\s*unicom|\bunicom\b)", re.I)
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 NOISE_RE = re.compile(r"[\s\-_（）()【】\[\]·.、,，]+")
@@ -63,9 +66,10 @@ SUFFIX_RE = re.compile(r"(高清|超清|蓝光|频道|直播|hd|uhd|fhd|4k|1080p
 
 class Channel(object):
     __slots__ = ("name", "tvg_id", "tvg_logo", "group", "urls", "source",
-                 "region", "fastest_ms")
+                 "region", "fastest_ms", "url_isps")
 
-    def __init__(self, name, tvg_id, tvg_logo, group, url, source, region="", fastest_ms=None):
+    def __init__(self, name, tvg_id, tvg_logo, group, url, source, region="",
+                 fastest_ms=None, isp=""):
         self.name = name
         self.tvg_id = tvg_id
         self.tvg_logo = tvg_logo
@@ -74,6 +78,7 @@ class Channel(object):
         self.source = source
         self.region = region
         self.fastest_ms = fastest_ms
+        self.url_isps = [isp]
 
     def key(self):
         k = NOISE_RE.sub("", self.name).upper()
@@ -88,6 +93,9 @@ def is_allowed(ch):
     """CCTV, mainland satellite, three named HK channels, or TW candidates."""
     if ch.region == "TW":
         return True
+    text = " ".join((ch.name, ch.group, ch.source) + tuple(ch.urls))
+    if ISP_MOBILE_RE.search(text) or ISP_UNICOM_RE.search(text):
+        return True
     for pattern in (CCTV_RE, CNTV_RE):
         if pattern.search(ch.name) or pattern.search(ch.group):
             return True
@@ -97,6 +105,16 @@ def is_allowed(ch):
 def is_tw_source(source):
     upper = source.upper()
     return "TW" in upper or "TAIWAN" in upper or "台湾" in source
+
+
+def detect_isp(*parts):
+    """Return 移动 / 联通 / empty by scanning names, groups, sources and URLs."""
+    text = " ".join(p or "" for p in parts)
+    if ISP_MOBILE_RE.search(text):
+        return "移动"
+    if ISP_UNICOM_RE.search(text):
+        return "联通"
+    return ""
 
 
 def is_ipv6(url):
@@ -150,6 +168,7 @@ def parse_m3u(text, source):
         if ADULT_RE.search(name) or ADULT_RE.search(group):
             continue
         region = "TW" if (is_tw_source(source) or TW_RE.search(name) or TW_RE.search(group)) else ""
+        isp = detect_isp(name, group, source, url)
         result.append(Channel(
             name=name,
             tvg_id=attrs.get("tvg-id", ""),
@@ -158,6 +177,7 @@ def parse_m3u(text, source):
             url=url,
             source=source,
             region=region,
+            isp=isp,
         ))
     return result
 
@@ -175,6 +195,7 @@ def merge(channels):
         existing = merged[k]
         if len(existing.urls) < 6 and ch.urls[0] not in existing.urls:
             existing.urls.append(ch.urls[0])
+            existing.url_isps.append(ch.url_isps[0] if ch.url_isps else "")
         if not existing.tvg_logo and ch.tvg_logo:
             existing.tvg_logo = ch.tvg_logo
         if existing.group == "其他" and ch.group != "其他":
@@ -241,11 +262,30 @@ def validate(channels, workers, timeout, max_checks):
         hits = sorted(good.get(idx, []), key=lambda item: (0 if is_ipv6(item[1]) else 1, item[0]))
         if not hits:
             continue
-        ch.urls = [u for _, u in hits[:4]]
+        isp_for = dict(zip(ch.urls, ch.url_isps))
+        # 移动/联通都可用时各保留一条，其余按优先级补齐
+        chosen = []
+        for isp in ("移动", "联通"):
+            for _, url in hits:
+                if isp_for.get(url) == isp and url not in chosen:
+                    chosen.append(url)
+                    break
+        for _, url in hits:
+            if len(chosen) >= 4:
+                break
+            if url not in chosen:
+                chosen.append(url)
+        ch.urls = chosen[:4]
+        ch.url_isps = [isp_for.get(u, "") for u in ch.urls]
         ch.fastest_ms = min(ms for ms, _ in hits)
         kept.append(ch)
     ipv6_total = sum(1 for ch in kept for u in ch.urls if is_ipv6(u))
-    log("验活通过: %d/%d 个频道 (IPv6 接口 %d 条)" % (len(kept), len(channels), ipv6_total))
+    mobile_total = sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps))
+    unicom_total = sum(1 for ch in kept if any(i == "联通" for i in ch.url_isps))
+    both_total = sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)
+                     and any(i == "联通" for i in ch.url_isps))
+    log("验活通过: %d/%d 个频道 (IPv6 %d 条, 移动 %d / 联通 %d / 双网 %d)"
+        % (len(kept), len(channels), ipv6_total, mobile_total, unicom_total, both_total))
     return kept
 
 
@@ -290,6 +330,7 @@ def write_status(out_dir, stats, sources):
         "- 验活通过: %d" % stats["valid"],
         "- CCTV: %d / 卫视(含指定香港频道): %d" % (stats["cctv"], stats["cntv"]),
         "- 台湾地区（通过稳定性门槛）: %d 个，剔除 %d 个" % (stats["tw"], stats["tw_dropped"]),
+        "- 运营商: 移动 %d / 联通 %d / 双网 %d 个频道" % (stats["mobile"], stats["unicom"], stats["both"]),
         "- IPv6 接口: %d 条（同频道优先）" % stats["ipv6"],
         "- 筛选范围: CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视 + 稳定台湾地区频道",
         "",
@@ -372,6 +413,7 @@ def main():
         kept = validate(merged, args.workers, args.timeout, args.max_checks)
         for ch in kept:
             ch.urls = ch.urls[:args.max_urls]
+            ch.url_isps = ch.url_isps[:args.max_urls]
         tw_all = [ch for ch in kept if ch.region == "TW"]
         tw_ok_ids = set()
         for ch in tw_all:
@@ -405,6 +447,10 @@ def main():
         "cntv": len(cntv),
         "tw": sum(1 for ch in kept if ch.region == "TW"),
         "tw_dropped": tw_dropped,
+        "mobile": sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)),
+        "unicom": sum(1 for ch in kept if any(i == "联通" for i in ch.url_isps)),
+        "both": sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)
+                     and any(i == "联通" for i in ch.url_isps)),
         "ipv6": sum(1 for ch in kept for u in ch.urls if is_ipv6(u)),
     }, source_stats)
     log("完成")
