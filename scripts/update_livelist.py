@@ -5,8 +5,10 @@
 Fetch Chinese-language IPTV playlists from several public sources, keep only
 CCTV / satellite (卫视) / selected Hong Kong channels (凤凰卫视、凤凰资讯、
 星空卫视), plus Taiwan-region channels that pass a reliability gate. Stream
-URLs are validated concurrently with IPv6 preference, then CCTV.m3u /
-CNTV.m3u / IPTV.m3u and a STATUS.md report are written. Standard library only.
+URLs are validated concurrently with IPv6 preference; failed-but-candidate
+URLs are kept as backups for official channels so each has enough sources.
+CCTV channels are ordered by channel number. CCTV.m3u / CNTV.m3u / IPTV.m3u
+and a STATUS.md report are written. Standard library only.
 
 Usage:
     python scripts/update_livelist.py
@@ -33,6 +35,8 @@ SOURCES = [
     ("iptv-org TW(China)", "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/tw.m3u"),
     ("iptv-org MO(China)", "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/mo.m3u"),
     ("fanmingming IPv6", "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/ipv6.m3u"),
+    ("fanmingming ITV", "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/itv.m3u"),
+    ("fanmingming index", "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/index.m3u"),
     ("Guovin iptv-api", "https://guovin.github.io/iptv-api/result.m3u"),
 ]
 EPG_URL = "https://epg.112114.xyz/pp.xml"
@@ -63,10 +67,21 @@ GOODTV_RE = re.compile(r"(good\s*tv|好电视)", re.I)
 DISPLAY_GROUPS = ("央视", "卫视", "港澳台", "央视付费")
 GROUP_ORDER = dict((name, i) for i, name in enumerate(DISPLAY_GROUPS))
 MAX_OUTPUT_URLS = 10
+MAX_CANDIDATE_URLS = 24  # 每频道候选池上限，验活+备用从此挑选
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 NOISE_RE = re.compile(r"[\s\-_（）()【】\[\]·.、,，]+")
 SUFFIX_RE = re.compile(r"(高清|超清|蓝光|频道|直播|hd|uhd|fhd|4k|1080p|720p)$", re.I)
+# 画质/编码/帧率等修饰词，归一化时去掉，保证同一电视台只显示一次。
+QUALITY_RE = re.compile(
+    r"(高清|超清|蓝光|超高清|标清|\d+k|\d+p|\di|hevc|h265|h264|"
+    r"\d+\s*fps|4k|uhd|fhd|hdr|50fps|60fps)",
+    re.I,
+)
+CN_CHANNEL_SUFFIX_RE = re.compile(
+    r"(综合|财经|综艺|体育赛事|体育|电影|电视剧|戏曲|少儿|军事|新闻|"
+    r"纪录|记录|科教|社会与法|农业农村|国际|中文国际)$",
+)
 
 
 class Channel(object):
@@ -87,8 +102,12 @@ class Channel(object):
         self.display_group = display_group
 
     def key(self):
-        k = NOISE_RE.sub("", self.name).upper()
-        return SUFFIX_RE.sub("", k) or k.upper()
+        # 去画质/帧率修饰词 → 去中文频道后缀 → 去噪点 → 去尾部画质词
+        k = QUALITY_RE.sub("", self.name)
+        k = CN_CHANNEL_SUFFIX_RE.sub("", k.strip())
+        k = NOISE_RE.sub("", k).upper()
+        k = SUFFIX_RE.sub("", k)
+        return k or self.name.upper()
 
 
 def log(msg):
@@ -227,7 +246,7 @@ def parse_m3u(text, source):
 
 
 def merge(channels):
-    """Deduplicate by normalized name, keeping up to 12 URLs per channel."""
+    """Deduplicate by normalized name, keeping up to MAX_CANDIDATE_URLS per channel."""
     merged = {}
     for ch in channels:
         k = ch.key()
@@ -237,7 +256,7 @@ def merge(channels):
             merged[k] = ch
             continue
         existing = merged[k]
-        if len(existing.urls) < 12 and ch.urls[0] not in existing.urls:
+        if len(existing.urls) < MAX_CANDIDATE_URLS and ch.urls[0] not in existing.urls:
             existing.urls.append(ch.urls[0])
             existing.url_isps.append(ch.url_isps[0] if ch.url_isps else "")
         if not existing.tvg_logo and ch.tvg_logo:
@@ -301,10 +320,12 @@ def validate(channels, workers, timeout, max_checks):
             idx, _ = futures[fut]
             good.setdefault(idx, []).append((ms, url))
     kept = []
+    backup_total = 0
     for idx, ch in enumerate(channels):
         # IPv6 接口优先；同等协议下按响应延迟排序
         hits = sorted(good.get(idx, []), key=lambda item: (0 if is_ipv6(item[1]) else 1, item[0]))
-        if not hits:
+        # 台湾地区频道必须验活通过才纳入（稳定性门槛不放宽）
+        if not hits and ch.region == "TW":
             continue
         isp_for = dict(zip(ch.urls, ch.url_isps))
         # 移动/联通都可用时各保留一条，其余按优先级补齐
@@ -319,9 +340,21 @@ def validate(channels, workers, timeout, max_checks):
                 break
             if url not in chosen:
                 chosen.append(url)
+        verified_count = len(chosen)
+        # 备用补齐：验活失败（多为电信/移动内网，境外节点不可达）的候选源
+        # 排在已验活源之后，保证每个官方频道都有足够多的可选源。
+        if verified_count < MAX_OUTPUT_URLS:
+            for url in ch.urls:
+                if len(chosen) >= MAX_OUTPUT_URLS:
+                    break
+                if url not in chosen:
+                    chosen.append(url)
+            backup_total += len(chosen) - verified_count
+        if not chosen:
+            continue
         ch.urls = chosen[:MAX_OUTPUT_URLS]
         ch.url_isps = [isp_for.get(u, "") for u in ch.urls]
-        ch.fastest_ms = min(ms for ms, _ in hits)
+        ch.fastest_ms = min(ms for ms, _ in hits) if hits else None
         kept.append(ch)
     ipv6_total = sum(1 for ch in kept for u in ch.urls if is_ipv6(u))
     mobile_total = sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps))
@@ -330,7 +363,33 @@ def validate(channels, workers, timeout, max_checks):
                      and any(i == "联通" for i in ch.url_isps))
     log("验活通过: %d/%d 个频道 (IPv6 %d 条, 移动 %d / 联通 %d / 双网 %d)"
         % (len(kept), len(channels), ipv6_total, mobile_total, unicom_total, both_total))
-    return kept
+    log("备用补齐 %d 条源（验活失败但保留作备用）" % backup_total)
+    return kept, backup_total
+
+
+CCTV_NUM_RE = re.compile(r"cctv\s*-?\s*(\d+)\s*(\+?)", re.I)
+
+
+def normalize_display_name(name):
+    """把 CCTV 画质变体统一成规范显示名，如 CCTV-5+ / CCTV-4。"""
+    k = QUALITY_RE.sub("", name)
+    k = CN_CHANNEL_SUFFIX_RE.sub("", k.strip())
+    m = re.search(r"cctv\s*-?\s*(\d+)\s*(\+?)", k, re.I)
+    if m:
+        return "CCTV-%s%s" % (m.group(1), m.group(2))
+    return name
+
+
+def channel_sort_key(ch):
+    """央视/央视付费按频道号排序（5+ 紧跟 5），其余按名称。"""
+    group_rank = GROUP_ORDER.get(ch.display_group, 99)
+    if ch.display_group in ("央视", "央视付费"):
+        m = CCTV_NUM_RE.search(ch.name)
+        if m:
+            return (group_rank, int(m.group(1)), 1 if m.group(2) else 0,
+                    normalize_display_name(ch.name))
+        return (group_rank, 999, 0, ch.name)
+    return (group_rank, 0, 0, ch.name)
 
 
 def extinf(ch):
@@ -373,7 +432,8 @@ def write_status(out_dir, stats, sources):
         "- 最近更新: %s (北京时间)" % now.strftime("%Y-%m-%d %H:%M:%S"),
         "- 源数量: %d" % stats["sources"],
         "- 抓取频道: %d (去重后 %d)" % (stats["raw"], stats["merged"]),
-        "- 验活通过: %d" % stats["valid"],
+        "- 验活通过: %d；备用补齐源: %d 条（验活失败但保留，央视/卫视优先）"
+        % (stats["valid"], stats.get("backup_total", 0)),
         "- CCTV: %d / 卫视(含港澳台): %d" % (stats["cctv"], stats["cntv"]),
         "- 分组: 央视 %d / 卫视 %d / 港澳台 %d / 央视付费 %d"
         % (stats["g_cctv"], stats["g_sat"], stats["g_hkmo"], stats["g_pay"]),
@@ -474,6 +534,7 @@ def main():
     merged = merged[:args.max_channels]
 
     tw_dropped = 0
+    backup_total = 0
     if args.skip_validate:
         tw_candidates = [ch for ch in merged if ch.region == "TW"]
         if tw_candidates:
@@ -482,7 +543,7 @@ def main():
         kept = [ch for ch in merged if ch.region != "TW"]
         log("已跳过验活 (--skip-validate)")
     else:
-        kept = validate(merged, args.workers, args.timeout, args.max_checks)
+        kept, backup_total = validate(merged, args.workers, args.timeout, args.max_checks)
         for ch in kept:
             ch.urls = ch.urls[:args.max_urls]
             ch.url_isps = ch.url_isps[:args.max_urls]
@@ -503,12 +564,27 @@ def main():
 
     for ch in kept:
         ch.display_group = classify_display_group(ch)
+        if ch.display_group in ("央视", "央视付费"):
+            ch.name = normalize_display_name(ch.name)
+    # 规范化名字后可能出现重复（如 CCTV-1 与 CCTV 1），再合并一次
+    regrouped = {}
+    for ch in kept:
+        k = (ch.display_group, ch.key())
+        if k not in regrouped:
+            regrouped[k] = ch
+            continue
+        existing = regrouped[k]
+        for url in ch.urls:
+            if url not in existing.urls and len(existing.urls) < MAX_OUTPUT_URLS:
+                existing.urls.append(url)
+                existing.url_isps.append("")
+    kept = list(regrouped.values())
     before_group = len(kept)
     kept = [ch for ch in kept if ch.display_group]
     group_dropped = before_group - len(kept)
     if group_dropped:
         log("按央视/卫视/港澳台/央视付费四类分组剔除 %d 个未匹配频道" % group_dropped)
-    kept.sort(key=lambda c: GROUP_ORDER.get(c.display_group, 99))
+    kept.sort(key=channel_sort_key)
 
     cctv = [c for c in kept if c.display_group in ("央视", "央视付费")]
     cntv = [c for c in kept if c.display_group in ("卫视", "港澳台")]
@@ -529,6 +605,7 @@ def main():
         "tw": sum(1 for ch in kept if ch.region == "TW"),
         "tw_dropped": tw_dropped,
         "other_dropped": other_dropped,
+        "backup_total": backup_total,
         "goodtv_dropped": goodtv_dropped,
         "group_dropped": group_dropped,
         "g_cctv": sum(1 for ch in kept if ch.display_group == "央视"),
