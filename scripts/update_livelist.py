@@ -8,7 +8,9 @@ CCTV / satellite (卫视) / selected Hong Kong channels (凤凰卫视、凤凰�
 URLs are validated concurrently with IPv6 preference; failed-but-candidate
 URLs are kept as backups for official channels so each has enough sources.
 CCTV channels are ordered by channel number. CCTV.m3u / CNTV.m3u / IPTV.m3u
-and a STATUS.md report are written. Standard library only.
+(the merged multi-source format), TVLives.txt (TVBox text format containing
+only validated sources, one line per channel+URL) and a STATUS.md report are
+written. Standard library only.
 
 Usage:
     python scripts/update_livelist.py
@@ -38,7 +40,10 @@ SOURCES = [
     ("fanmingming ITV", "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/itv.m3u"),
     ("fanmingming index", "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/index.m3u"),
     ("Guovin iptv-api", "https://guovin.github.io/iptv-api/result.m3u"),
+    ("MyTV TVLives", "https://raw.githubusercontent.com/amygoTV/MyTV/master/TVLives.txt"),
 ]
+# 源格式：默认 m3u；.txt 结尾的是 TVBox 文本订阅格式。
+TXT_SOURCE_KEY = "TVLives"
 EPG_URL = "https://epg.112114.xyz/pp.xml"
 
 # Names/groups that must never be mixed into the general lists.
@@ -74,7 +79,8 @@ BAD_SOURCE_RE = re.compile(
 DISPLAY_GROUPS = ("央视", "卫视", "港澳台", "央视付费")
 GROUP_ORDER = dict((name, i) for i, name in enumerate(DISPLAY_GROUPS))
 MAX_OUTPUT_URLS = 10
-MAX_CANDIDATE_URLS = 24  # 每频道候选池上限，验活+备用从此挑选
+MAX_CANDIDATE_URLS = 40  # 每频道候选池上限，验活+备用从此挑选
+MAX_TXT_URLS = 12  # TVBox TXT 每频道最多线路数（含未验活的国内源）
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 NOISE_RE = re.compile(r"[\s\-_（）()【】\[\]·.、,，]+")
@@ -93,7 +99,8 @@ CN_CHANNEL_SUFFIX_RE = re.compile(
 
 class Channel(object):
     __slots__ = ("name", "tvg_id", "tvg_logo", "group", "urls", "source",
-                 "region", "fastest_ms", "url_isps", "display_group")
+                 "region", "fastest_ms", "url_isps", "display_group",
+                 "verified_urls", "m3u_ok")
 
     def __init__(self, name, tvg_id, tvg_logo, group, url, source, region="",
                  fastest_ms=None, isp="", display_group=""):
@@ -107,6 +114,10 @@ class Channel(object):
         self.fastest_ms = fastest_ms
         self.url_isps = [isp]
         self.display_group = display_group
+        # 境外验活通过的源，供 TVBox TXT 输出使用（不含备用补齐源）
+        self.verified_urls = []
+        # 是否写入 M3U（台湾地区频道稳定性不达标时为 False，但 TXT 仍保留）
+        self.m3u_ok = True
 
     def key(self):
         # 去画质/帧率修饰词 → 去中文频道后缀 → 去噪点 → 去尾部画质词
@@ -265,6 +276,40 @@ def parse_m3u(text, source):
     return result
 
 
+def parse_txt(text, source):
+    """解析 TVBox 文本订阅格式：'分组,#genre#' + '频道名,URL' 行。"""
+    result = []
+    group = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.endswith("#genre#"):
+            group = line.split(",", 1)[0].strip()
+            continue
+        if "," not in line:
+            continue
+        name, url = line.split(",", 1)
+        name, url = name.strip(), url.strip()
+        if not url.startswith(("http://", "https://")) or not name:
+            continue
+        if META_RE.match(name) or "更新时间" in group:
+            continue
+        if ADULT_RE.search(name) or ADULT_RE.search(group):
+            continue
+        if GOODTV_RE.search(name) or GOODTV_RE.search(group) or GOODTV_RE.search(url):
+            continue
+        if BAD_SOURCE_RE.search(url):
+            continue
+        region = "TW" if (is_tw_source(source) or TW_RE.search(name) or TW_RE.search(group)) else ""
+        isp = detect_isp(name, group, source, url)
+        result.append(Channel(
+            name=name, tvg_id="", tvg_logo="", group=group or "其他",
+            url=url, source=source, region=region, isp=isp,
+        ))
+    return result
+
+
 def merge(channels):
     """Deduplicate by normalized name, keeping up to MAX_CANDIDATE_URLS per channel."""
     merged = {}
@@ -279,6 +324,9 @@ def merge(channels):
         if len(existing.urls) < MAX_CANDIDATE_URLS and ch.urls[0] not in existing.urls:
             existing.urls.append(ch.urls[0])
             existing.url_isps.append(ch.url_isps[0] if ch.url_isps else "")
+        for u in ch.verified_urls:
+            if u not in existing.verified_urls:
+                existing.verified_urls.append(u)
         if not existing.tvg_logo and ch.tvg_logo:
             existing.tvg_logo = ch.tvg_logo
         if existing.group == "其他" and ch.group != "其他":
@@ -344,9 +392,7 @@ def validate(channels, workers, timeout, max_checks):
     for idx, ch in enumerate(channels):
         # IPv6 接口优先；同等协议下按响应延迟排序
         hits = sorted(good.get(idx, []), key=lambda item: (0 if is_ipv6(item[1]) else 1, item[0]))
-        # 台湾地区频道必须验活通过才纳入（稳定性门槛不放宽）
-        if not hits and ch.region == "TW":
-            continue
+        # 台湾地区频道的稳定性门槛在 main 里对 M3U 生效；TXT 保留其国内候选源。
         isp_for = dict(zip(ch.urls, ch.url_isps))
         # 移动/联通都可用时各保留一条，其余按优先级补齐
         chosen = []
@@ -372,6 +418,14 @@ def validate(channels, workers, timeout, max_checks):
             backup_total += len(chosen) - verified_count
         if not chosen:
             continue
+        # TXT 源顺序：验活通过的排最前（播放器默认取第一条作兜底），
+        # 其后跟该频道全部候选源（含国内 IPv6 内网源，境外验活不了但用户本地可播）。
+        # 不按境外验活结果删除源——只去重并限流。
+        txt_urls = [u for _, u in hits]
+        for u in ch.urls:  # ch.urls 此刻仍是 merge 后的完整候选池
+            if u not in txt_urls:
+                txt_urls.append(u)
+        ch.verified_urls = txt_urls[:MAX_TXT_URLS]
         ch.urls = chosen[:MAX_OUTPUT_URLS]
         ch.url_isps = [isp_for.get(u, "") for u in ch.urls]
         ch.fastest_ms = min(ms for ms, _ in hits) if hits else None
@@ -434,6 +488,28 @@ def write_m3u(path, channels):
         % (os.path.basename(path), len(channels), sum(len(c.urls) for c in channels)))
 
 
+def write_txt(path, channels):
+    """TVBox 文本订阅格式：分组,#genre# + 每条验活通过源独立一行。"""
+    lines = []
+    total = 0
+    for group in DISPLAY_GROUPS:
+        group_chs = [c for c in channels if c.display_group == group]
+        if not group_chs:
+            continue
+        lines.append("%s,#genre#" % group)
+        lines.append("")
+        for ch in group_chs:
+            urls = ch.verified_urls[:MAX_OUTPUT_URLS]
+            for url in urls:
+                lines.append("%s,%s" % (ch.name, url))
+                total += 1
+        lines.append("")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    log("写入 %s (%d 个频道, %d 条验活源)"
+        % (os.path.basename(path), len(channels), total))
+
+
 def update_epg(out_dir, timeout=40):
     path = os.path.join(out_dir, "EPG.xml")
     try:
@@ -468,6 +544,8 @@ def write_status(out_dir, stats, sources):
         "- 运营商: 移动 %d / 联通 %d / 双网 %d 个频道" % (stats["mobile"], stats["unicom"], stats["both"]),
         "- 剔除“其他”类目: %d 个（台湾地区/运营商已归类保留）" % stats["other_dropped"],
         "- IPv6 接口: %d 条（同频道优先）" % stats["ipv6"],
+        "- TVLives.txt: %d 个频道 / %d 条线路（含国内源，仅去重不限流删源）"
+        % (stats.get("txt_channels", 0), stats.get("txt_urls", 0)),
         "- 筛选范围: CCTV + 卫视 + 凤凰卫视/凤凰资讯/星空卫视 + 稳定台湾地区频道 + 移动/联通资源",
         "",
         "## 数据源",
@@ -479,11 +557,12 @@ def write_status(out_dir, stats, sources):
         "",
         "## 订阅地址",
         "",
-        "- `https://raw.githubusercontent.com/amygoTV/Livelist/main/IPTV.m3u`",
+        "- `https://raw.githubusercontent.com/amygoTV/Livelist/main/IPTV.m3u`（M3U 合并多源）",
         "- `https://raw.githubusercontent.com/amygoTV/Livelist/main/CCTV.m3u`",
         "- `https://raw.githubusercontent.com/amygoTV/Livelist/main/CNTV.m3u`",
+        "- `https://raw.githubusercontent.com/amygoTV/Livelist/main/TVLives.txt`（TVBox 文本格式，每条源独立线路，含国内源）",
         "",
-        "> 直播源随时可能失效，本仓库每 6 小时自动验活更新。仅供个人合法研究使用。",
+        "> IPTV.m3u 为「单频道多源」合并写法；TVLives.txt 为 TVBox 常用的文本订阅格式（分组,#genre# + 频道名,URL），每条源都是独立线路，兼容性更好。TVLives.txt 保留全部候选源（验活通过的排前面作兜底，其后为国内运营商源——境外节点验活不了但你本地可能可播），不因境外验活失败而删源。本仓库每 6 小时自动更新。仅供个人合法研究使用。",
         "",
     ]
     with open(os.path.join(out_dir, "STATUS.md"), "w", encoding="utf-8", newline="\n") as f:
@@ -513,16 +592,20 @@ def main():
 
     all_channels = []
     source_stats = []
+    def parse_by_label(text, label):
+        return parse_txt(text, label) if label.lower().endswith(".txt") or TXT_SOURCE_KEY in label else parse_m3u(text, label)
+
     if args.source_file:
         for path in args.source_file:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
-                items = parse_m3u(f.read(), os.path.basename(path))
+                raw = f.read()
+            items = parse_txt(raw, os.path.basename(path)) if os.path.basename(path).lower().endswith(".txt") else parse_m3u(raw, os.path.basename(path))
             source_stats.append((os.path.basename(path), len(items), True))
             all_channels.extend(items)
     else:
         for label, url in SOURCES:
             try:
-                items = parse_m3u(fetch(url), label)
+                items = parse_by_label(fetch(url), label)
                 source_stats.append((label, len(items), True))
                 log("%s: %d 条" % (label, len(items)))
                 all_channels.extend(items)
@@ -560,61 +643,72 @@ def main():
 
     tw_dropped = 0
     backup_total = 0
+    # all_kept = 所有频道全集（TXT 用）；其中 m3u_ok 的才写入 M3U。
     if args.skip_validate:
         tw_candidates = [ch for ch in merged if ch.region == "TW"]
         if tw_candidates:
-            log("已跳过验活，%d 个台湾地区频道因无法判定稳定性不纳入" % len(tw_candidates))
+            log("已跳过验活，%d 个台湾地区频道 M3U 不纳入（TXT 保留）" % len(tw_candidates))
             tw_dropped = len(tw_candidates)
-        kept = [ch for ch in merged if ch.region != "TW"]
+        all_kept = merged
+        for ch in all_kept:
+            ch.verified_urls = list(ch.urls[:args.max_urls])
+            if ch.region == "TW":
+                ch.m3u_ok = False
         log("已跳过验活 (--skip-validate)")
     else:
-        kept, backup_total = validate(merged, args.workers, args.timeout, args.max_checks)
-        for ch in kept:
+        all_kept, backup_total = validate(merged, args.workers, args.timeout, args.max_checks)
+        for ch in all_kept:
             ch.urls = ch.urls[:args.max_urls]
             ch.url_isps = ch.url_isps[:args.max_urls]
-        tw_all = [ch for ch in kept if ch.region == "TW"]
-        tw_ok_ids = set()
+        tw_all = [ch for ch in all_kept if ch.region == "TW"]
+        tw_ok = 0
         for ch in tw_all:
             good = (len(ch.urls) >= args.tw_min_urls
                     and ch.fastest_ms is not None
                     and ch.fastest_ms <= args.tw_max_latency)
+            ch.m3u_ok = good
             if good:
-                tw_ok_ids.add(id(ch))
-        tw_dropped = len(tw_all) - len(tw_ok_ids)
+                tw_ok += 1
+        tw_dropped = len(tw_all) - tw_ok
         if tw_dropped:
-            log("台湾地区频道因稳定性不足剔除 %d 个（要求 ≥%d 条可用接口且最快延迟 ≤%dms）"
-                % (tw_dropped, args.tw_min_urls, args.tw_max_latency))
-        if tw_all:
-            kept = [ch for ch in kept if ch.region != "TW" or id(ch) in tw_ok_ids]
+            log("M3U 台湾地区频道因稳定性不足剔除 %d 个（TXT 仍保留其国内源）"
+                % tw_dropped)
 
-    for ch in kept:
+    for ch in all_kept:
         ch.display_group = classify_display_group(ch)
         ch.name = normalize_display_name(ch.name)
     # 规范化名字后可能出现重复（如 CCTV-1 与 CCTV 1），再合并一次
     regrouped = {}
-    for ch in kept:
+    for ch in all_kept:
         k = (ch.display_group, ch.key())
         if k not in regrouped:
             regrouped[k] = ch
             continue
         existing = regrouped[k]
+        existing.m3u_ok = existing.m3u_ok or ch.m3u_ok
         for url in ch.urls:
             if url not in existing.urls and len(existing.urls) < MAX_OUTPUT_URLS:
                 existing.urls.append(url)
                 existing.url_isps.append("")
-    kept = list(regrouped.values())
-    before_group = len(kept)
-    kept = [ch for ch in kept if ch.display_group]
-    group_dropped = before_group - len(kept)
+        for u in ch.verified_urls:
+            if u not in existing.verified_urls:
+                existing.verified_urls.append(u)
+    all_kept = list(regrouped.values())
+    before_group = len(all_kept)
+    all_kept = [ch for ch in all_kept if ch.display_group]
+    group_dropped = before_group - len(all_kept)
     if group_dropped:
         log("按央视/卫视/港澳台/央视付费四类分组剔除 %d 个未匹配频道" % group_dropped)
-    kept.sort(key=channel_sort_key)
+    all_kept.sort(key=channel_sort_key)
 
+    # M3U：仅 m3u_ok（台湾地区频道需过稳定性门槛）；TXT：全部频道含国内源
+    kept = [ch for ch in all_kept if ch.m3u_ok]
     cctv = [c for c in kept if c.display_group in ("央视", "央视付费")]
     cntv = [c for c in kept if c.display_group in ("卫视", "港澳台")]
     write_m3u(os.path.join(out, "IPTV.m3u"), kept)
     write_m3u(os.path.join(out, "CCTV.m3u"), cctv)
     write_m3u(os.path.join(out, "CNTV.m3u"), cntv)
+    write_txt(os.path.join(out, "TVLives.txt"), all_kept)
 
     if not args.no_epg:
         update_epg(out)
@@ -641,6 +735,8 @@ def main():
         "both": sum(1 for ch in kept if any(i == "移动" for i in ch.url_isps)
                      and any(i == "联通" for i in ch.url_isps)),
         "ipv6": sum(1 for ch in kept for u in ch.urls if is_ipv6(u)),
+        "txt_channels": len(all_kept),
+        "txt_urls": sum(len(c.verified_urls[:MAX_TXT_URLS]) for c in all_kept),
     }, source_stats)
     log("完成")
     return 0
