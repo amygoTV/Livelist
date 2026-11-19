@@ -47,7 +47,8 @@ META_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s", re.I)
 CCTV_RE = re.compile(r"(cctv|央视|中央|cntv)", re.I)
 # 仅保留大陆卫视 + 指定的中国香港频道，不再纳入其他港台频道
 CNTV_RE = re.compile(
-    r"(卫视|卫星|凤凰卫视|凤凰资讯|星空卫视|phoenix\s*(?:tv|info)|\bifeng\b|star\s*chinese)",
+    r"(卫视|卫星|凤凰卫视|凤凰资讯|星空卫视|星空衛視|鳳凰衛視|鳳凰資訊|"
+    r"phoenix\s*(?:tv|info)|\bifeng\b|star\s*(?:chinese|tv)|STARTV)",
     re.I,
 )
 # 台湾地区频道先进入验活，只有满足下列稳定性门槛才写入列表。
@@ -64,6 +65,12 @@ ISP_MOBILE_RE = re.compile(r"(移动|cmcc|china\s*mobile)", re.I)
 ISP_UNICOM_RE = re.compile(r"(联通|cucc|china\s*unicom)", re.I)
 OTHER_GROUP_RE = re.compile(r"^(其他|其它|未分类|other|uncategorized)?$", re.I)
 GOODTV_RE = re.compile(r"(good\s*tv|好电视)", re.I)
+# 明确的错台源域名：这些是其他电视台/平台的流，被公开源站错标成央视/卫视。
+# 典型：liveplay-srs.voc.com.cn 是湖南芒果TV域名，却被标成 tvg-id="CCTV1.cn@SD"。
+BAD_SOURCE_RE = re.compile(
+    r"(voc\.com\.cn|mgtv\.com)",  # 湖南芒果TV（冒充 CCTV1 等）
+    re.I,
+)
 DISPLAY_GROUPS = ("央视", "卫视", "港澳台", "央视付费")
 GROUP_ORDER = dict((name, i) for i, name in enumerate(DISPLAY_GROUPS))
 MAX_OUTPUT_URLS = 10
@@ -124,6 +131,9 @@ def is_allowed(ch):
     for pattern in (CCTV_RE, CNTV_RE):
         if pattern.search(ch.name) or pattern.search(ch.group):
             return True
+    # 部分源站名字不含台名，只在 URL 里带 STARTV 标识
+    if re.search(r"startv|star[\s_-]*(?:chinese|tv)", text, re.I):
+        return True
     return False
 
 
@@ -148,13 +158,20 @@ def is_other_group(ch):
 
 
 def fix_uncategorized(ch):
-    """Promote TW / ISP channels out of '其他' before the category filter."""
+    """Promote TW / 港澳台 / ISP channels out of '其他' before the filter."""
     if not is_other_group(ch):
         return ""
     if ch.region == "TW":
         ch.group = "台湾地区"
         return "tw"
     text = " ".join((ch.name, ch.source) + tuple(ch.urls))
+    lower = text.lower()
+    # 港澳台指定频道（凤凰/星空等）常被源站标成"其他"，需先归类保留
+    if (re.search(r"凤凰|鳳凰|星空卫视|星空衛視|翡翠|本港", text)
+            or "startv" in lower or "phoenix" in lower or "tvb" in lower
+            or re.search(r"star\s*(?:chinese|tv)", text, re.I)):
+        ch.group = "港澳台"
+        return "hkmo"
     if ISP_MOBILE_RE.search(text) or ISP_UNICOM_RE.search(text):
         ch.group = "运营商"
         return "isp"
@@ -170,8 +187,9 @@ def classify_display_group(ch):
         return u"央视"
     lower = text.lower()
     if (ch.region == "TW" or u"港澳台" in ch.group or u"凤凰" in text
-            or u"星空" in text or u"翡翠" in text or u"本港" in text
-            or "tvb" in lower):
+            or u"鳳凰" in text or u"星空" in text or "startv" in lower
+            or "star" in lower and ("chinese" in lower or "tv" in lower)
+            or u"翡翠" in text or u"本港" in text or "tvb" in lower):
         return u"港澳台"
     if CNTV_RE.search(text):
         return u"卫视"
@@ -229,6 +247,8 @@ def parse_m3u(text, source):
         if ADULT_RE.search(name) or ADULT_RE.search(group):
             continue
         if GOODTV_RE.search(name) or GOODTV_RE.search(group) or GOODTV_RE.search(url):
+            continue
+        if BAD_SOURCE_RE.search(url):  # 错台源（如芒果TV冒充CCTV1）
             continue
         region = "TW" if (is_tw_source(source) or TW_RE.search(name) or TW_RE.search(group)) else ""
         isp = detect_isp(name, group, source, url)
@@ -371,13 +391,18 @@ CCTV_NUM_RE = re.compile(r"cctv\s*-?\s*(\d+)\s*(\+?)", re.I)
 
 
 def normalize_display_name(name):
-    """把 CCTV 画质变体统一成规范显示名，如 CCTV-5+ / CCTV-4。"""
+    """把 CCTV 画质变体统一成规范显示名，并把繁体台名转为简体。"""
     k = QUALITY_RE.sub("", name)
     k = CN_CHANNEL_SUFFIX_RE.sub("", k.strip())
     m = re.search(r"cctv\s*-?\s*(\d+)\s*(\+?)", k, re.I)
     if m:
         return "CCTV-%s%s" % (m.group(1), m.group(2))
-    return name
+    # 繁体台名统一为简体，避免「星空衛視」与「星空卫视」重复显示
+    for trad, simp in (("星空衛視", "星空卫视"), ("鳳凰衛視", "凤凰卫视"),
+                       ("鳳凰資訊", "凤凰资讯")):
+        k = k.replace(trad, simp)
+    k = re.sub(r"\(\s*\)|（\s*）", "", k)  # 去画质词后残留的空括号
+    return k.strip() or name
 
 
 def channel_sort_key(ch):
@@ -564,8 +589,7 @@ def main():
 
     for ch in kept:
         ch.display_group = classify_display_group(ch)
-        if ch.display_group in ("央视", "央视付费"):
-            ch.name = normalize_display_name(ch.name)
+        ch.name = normalize_display_name(ch.name)
     # 规范化名字后可能出现重复（如 CCTV-1 与 CCTV 1），再合并一次
     regrouped = {}
     for ch in kept:
